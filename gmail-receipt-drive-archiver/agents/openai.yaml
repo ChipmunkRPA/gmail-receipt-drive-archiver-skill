@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gmail Receipt Drive Archiver"
+  short_description: "Print unread receipt emails to Drive PDFs"
+  default_prompt: "Use $gmail-receipt-drive-archiver to print unread receipt emails to PDF, create a date-based Drive folder, upload the PDFs, and mark those emails read."
