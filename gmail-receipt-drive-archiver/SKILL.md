@@ -17,11 +17,13 @@ Use this skill when the user wants a Gmail cleanup/archive pass that:
 ## Workflow
 
 1. Confirm `gws` auth works for Gmail and Drive.
-2. From the skill directory, ensure Node dependencies are installed:
+2. (Optional) Preinstall Node dependencies from the skill directory:
 
 ```powershell
 npm install
 ```
+
+   The Python script now auto-installs missing Node deps (`playwright-core`) when needed.
 
 3. Run the archiver script:
 
@@ -37,9 +39,12 @@ python scripts/process_unread_receipts.py
 ## Behavior
 
 - The script creates or reuses a Drive folder named `M.D.YYYY processed invoice` using the current local date.
-- If that folder already exists, it clears the folder before uploading the new PDFs for that run.
-- Matching is based on Gmail search plus subject/snippet checks only. It does not extract amounts or try to semantically summarize the email body.
+- If that folder already exists, the script appends new PDFs to the existing folder contents (no clearing/deletion).
+- Matching is based on Gmail search plus subject/snippet checks and attachment signals (image/PDF attachments + commerce hints, and receipt-like attachment filenames).
+- Forwarded receipt/order emails (for example, `Fwd:` Uber Eats order receipts) are also treated as candidates when forward markers and commerce/receipt hints are present.
+- Official filing/payment receipts (for example, USPTO trademark filing receipts with serial number and amount paid) are treated as candidates based on sender/subject/snippet clues.
 - The PDF is produced from rendered email HTML so inline images and image-based totals can survive into the PDF.
+- Non-inline image attachments (for example, a PNG/JPG scanned receipt) are appended into the rendered PDF under an attachments section.
 - Local artifacts are written under the current working directory:
   - `output/pdf/`
   - `tmp/email_html/`

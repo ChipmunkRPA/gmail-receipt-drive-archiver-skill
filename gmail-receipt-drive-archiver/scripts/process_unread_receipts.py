@@ -5,12 +5,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from email import policy
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
+from time import sleep
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -18,7 +20,14 @@ GWS_EXE = os.environ.get("GWS_EXE") or shutil.which("gws") or r"C:\Codex\tools\g
 GWS_CONFIG_DIR = os.environ.get("GOOGLE_WORKSPACE_CLI_CONFIG_DIR") or r"C:\Codex\.config\gws"
 OUTPUT_DIR = Path.cwd() / "output" / "pdf"
 HTML_DIR = Path.cwd() / "tmp" / "email_html"
-SEARCH_QUERY = 'is:unread (receipt OR invoice OR purchase OR "order confirmation" OR "order number" OR "payment receipt" OR "payment verification" OR "business receipt" OR "purchase is complete" OR "status paid")'
+NODE_MODULES_DIR = SKILL_DIR / "node_modules"
+PLAYWRIGHT_CORE_DIR = NODE_MODULES_DIR / "playwright-core"
+SEARCH_QUERY = (
+    'is:unread ((receipt OR invoice OR purchase OR "order confirmation" OR "order number" OR '
+    '"payment receipt" OR "payment verification" OR "business receipt" OR "purchase is complete" OR '
+    '"status paid" OR "food delivery" OR takeout OR restaurant OR fantuan OR "uber eats" OR doordash OR grubhub OR seamless OR '
+    '"filing receipt" OR uspto OR "trademark application" OR "serial number" OR "amount paid") OR has:attachment)'
+)
 
 RECEIPT_PATTERNS = (
     r"\breceipt\b",
@@ -31,7 +40,78 @@ RECEIPT_PATTERNS = (
     r"\bbusiness receipt\b",
     r"\bpurchase is complete\b",
     r"\bstatus paid\b",
+    r"\bfood delivery\b",
+    r"\btakeout\b",
+    r"\brestaurant\b",
+    r"\bfantuan\b",
+    r"\buber eats\b",
+    r"\bdoordash\b",
+    r"\bgrubhub\b",
+    r"\bseamless\b",
 )
+
+COMMERCE_HINT_PATTERNS = (
+    r"\border\b",
+    r"\bdelivery\b",
+    r"\bfood\b",
+    r"\brestaurant\b",
+    r"\bmeal\b",
+    r"\btotal\b",
+    r"\bpaid\b",
+    r"\bcharge\b",
+    r"\buber eats\b",
+    r"\bdoordash\b",
+    r"\bgrubhub\b",
+    r"\bseamless\b",
+)
+
+FORWARD_PREFIX_PATTERNS = (
+    r"^\s*fwd:",
+    r"^\s*fw:",
+)
+
+FORWARDED_RECEIPT_HINT_PATTERNS = (
+    r"\border\b",
+    r"\breceipt\b",
+    r"\buber eats\b",
+    r"\bdoordash\b",
+    r"\bgrubhub\b",
+    r"\bfantuan\b",
+    r"\bfrom:\s*uber receipts\b",
+)
+
+GOV_RECEIPT_CORE_PATTERNS = (
+    r"\buspto\b",
+    r"\btrademark\b",
+    r"\bservice mark\b",
+    r"\bapplication\b",
+    r"\bserial number\b",
+    r"\bdocket number\b",
+    r"\bfiling date\b",
+)
+
+GOV_RECEIPT_PROOF_PATTERNS = (
+    r"\bfiling receipt\b",
+    r"\bamount paid\b",
+    r"\bpaid\b",
+    r"\bfee\b",
+    r"\bserial number\b",
+    r"\bdocket number\b",
+)
+
+ATTACHMENT_NAME_PATTERNS = (
+    r"\breceipt\b",
+    r"\binvoice\b",
+    r"\border\b",
+    r"\bbill\b",
+    r"\bstatement\b",
+    r"\bpayment\b",
+    r"\bscan\b",
+    r"\bimg\b",
+    r"\bphoto\b",
+)
+
+ATTACHMENT_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".heic", ".pdf")
 
 
 @dataclass
@@ -39,6 +119,8 @@ class Candidate:
     message_id: str
     subject: str
     snippet: str
+    sender: str
+    attachments: list[dict[str, str]]
 
 
 def folder_name_for_today() -> str:
@@ -46,8 +128,67 @@ def folder_name_for_today() -> str:
     return f"{now.month}.{now.day}.{now.year} processed invoice"
 
 
+def resolve_gws_exe() -> str:
+    candidates = [
+        os.environ.get("GWS_EXE"),
+        shutil.which("gws"),
+        shutil.which("gws.exe"),
+        r"C:\Codex\tools\gws\gws.exe",
+        r"C:\Codex\tools\gws\gws.EXE",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(Path(candidate))
+    raise FileNotFoundError(
+        "Could not find gws executable. Set GWS_EXE or add gws to PATH."
+    )
+
+
+def run_command(
+    command: list[str],
+    env: dict[str, str] | None = None,
+    timeout: int | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        cwd=str(cwd) if cwd else None,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def ensure_playwright_core() -> None:
+    if PLAYWRIGHT_CORE_DIR.exists():
+        return
+
+    npm_exe = shutil.which("npm.cmd") or shutil.which("npm")
+    if not npm_exe:
+        raise FileNotFoundError("npm was not found. Install Node.js/npm or add npm to PATH.")
+
+    install = run_command(
+        [npm_exe, "install", "--no-audit", "--no-fund"],
+        env=os.environ.copy(),
+        timeout=300,
+        cwd=SKILL_DIR,
+    )
+    if install.returncode != 0:
+        raise RuntimeError(
+            "Failed to install Node dependencies.\n"
+            f"Command: {' '.join([npm_exe, 'install', '--no-audit', '--no-fund'])}\n"
+            f"STDOUT:\n{install.stdout}\nSTDERR:\n{install.stderr}"
+        )
+    if not PLAYWRIGHT_CORE_DIR.exists():
+        raise RuntimeError("npm install completed, but playwright-core is still missing.")
+
+
 def gws(*args: str, params: dict | None = None, json_body: dict | None = None, upload: str | None = None) -> dict:
-    command = [GWS_EXE, *args]
+    command = [resolve_gws_exe(), *args]
     if params is not None:
         command.extend(["--params", json.dumps(params, separators=(",", ":"))])
     if json_body is not None:
@@ -58,12 +199,22 @@ def gws(*args: str, params: dict | None = None, json_body: dict | None = None, u
     env = os.environ.copy()
     env["GOOGLE_WORKSPACE_CLI_CONFIG_DIR"] = GWS_CONFIG_DIR
 
-    result = subprocess.run(command, capture_output=True, env=env, check=False)
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if result.returncode != 0:
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        result = run_command(command, env=env)
+        stdout = result.stdout
+        stderr = result.stderr
+        if result.returncode == 0:
+            return json.loads(stdout) if stdout.strip() else {}
+
+        # Retry transient transport/discovery failures.
+        retryable = ("discoveryError" in stdout) or ("tcp connect error" in stdout.lower())
+        if retryable and attempt < attempts:
+            sleep(attempt)
+            continue
+
         raise RuntimeError(f"gws failed: {' '.join(command)}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}")
-    return json.loads(stdout) if stdout.strip() else {}
+    raise RuntimeError("Unreachable gws retry state.")
 
 
 def normalize_text(value: str | None) -> str:
@@ -127,21 +278,6 @@ def ensure_drive_folder(folder_name: str) -> str:
     return created["id"]
 
 
-def clear_drive_folder(folder_id: str) -> None:
-    response = gws(
-        "drive",
-        "files",
-        "list",
-        params={
-            "q": f"trashed = false and '{folder_id}' in parents",
-            "fields": "files(id,name)",
-            "pageSize": 200,
-        },
-    )
-    for item in response.get("files", []):
-        gws("drive", "files", "delete", params={"fileId": item["id"]})
-
-
 def extract_header(message_json: dict, header_name: str) -> str:
     headers = message_json.get("payload", {}).get("headers", [])
     for header in headers:
@@ -150,9 +286,60 @@ def extract_header(message_json: dict, header_name: str) -> str:
     return ""
 
 
+def collect_attachment_metadata(payload: dict | None) -> list[dict[str, str]]:
+    attachments: list[dict[str, str]] = []
+    if not payload:
+        return attachments
+
+    def walk(part: dict) -> None:
+        filename = normalize_text(part.get("filename", ""))
+        mime_type = normalize_text(part.get("mimeType", "")).lower()
+        body = part.get("body", {}) or {}
+        has_attachment_id = bool(body.get("attachmentId"))
+        if filename or has_attachment_id:
+            attachments.append({"filename": filename, "mimeType": mime_type})
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+    return attachments
+
+
+def is_document_attachment(meta: dict[str, str]) -> bool:
+    filename = meta.get("filename", "").lower()
+    mime_type = meta.get("mimeType", "").lower()
+    if mime_type.startswith("image/") or mime_type == "application/pdf":
+        return True
+    return any(filename.endswith(ext) for ext in ATTACHMENT_EXTENSIONS)
+
+
+def attachment_name_looks_receipt(meta: dict[str, str]) -> bool:
+    filename = meta.get("filename", "").lower()
+    return any(re.search(pattern, filename) for pattern in ATTACHMENT_NAME_PATTERNS)
+
+
 def is_receipt_candidate(candidate: Candidate) -> bool:
-    haystack = f"{candidate.subject}\n{candidate.snippet}".lower()
-    return any(re.search(pattern, haystack) for pattern in RECEIPT_PATTERNS)
+    haystack = f"{candidate.subject}\n{candidate.snippet}\n{candidate.sender}".lower()
+    text_match = any(re.search(pattern, haystack) for pattern in RECEIPT_PATTERNS)
+    if text_match:
+        return True
+
+    subject = candidate.subject.lower()
+    is_forward = any(re.search(pattern, subject) for pattern in FORWARD_PREFIX_PATTERNS)
+    if is_forward and any(re.search(pattern, haystack) for pattern in FORWARDED_RECEIPT_HINT_PATTERNS):
+        return True
+
+    if any(attachment_name_looks_receipt(meta) for meta in candidate.attachments):
+        return True
+
+    has_gov_core = any(re.search(pattern, haystack) for pattern in GOV_RECEIPT_CORE_PATTERNS)
+    has_gov_proof = any(re.search(pattern, haystack) for pattern in GOV_RECEIPT_PROOF_PATTERNS)
+    if has_gov_core and has_gov_proof:
+        return True
+
+    has_document_attachment = any(is_document_attachment(meta) for meta in candidate.attachments)
+    has_commerce_hint = any(re.search(pattern, haystack) for pattern in COMMERCE_HINT_PATTERNS)
+    return has_document_attachment and has_commerce_hint
 
 
 def get_candidates() -> list[Candidate]:
@@ -177,6 +364,8 @@ def get_candidates() -> list[Candidate]:
                 message_id=item["id"],
                 subject=extract_header(detail, "Subject"),
                 snippet=normalize_text(detail.get("snippet", "")),
+                sender=extract_header(detail, "From"),
+                attachments=collect_attachment_metadata(detail.get("payload")),
             )
         )
     return [candidate for candidate in candidates if is_receipt_candidate(candidate)]
@@ -234,7 +423,7 @@ def inject_cid_images(html_body: str, cid_map: dict[str, str]) -> str:
     return updated
 
 
-def wrap_email_html(subject: str, sender: str, date_value: str, body_html: str) -> str:
+def wrap_email_html(subject: str, sender: str, date_value: str, body_html: str, attachments_html: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -263,9 +452,27 @@ def wrap_email_html(subject: str, sender: str, date_value: str, body_html: str) 
       margin: 4px 0;
       font-size: 13px;
     }}
+    .attachments {{
+      margin-top: 28px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 18px;
+    }}
+    .attachments h2 {{
+      margin: 0 0 12px;
+      font-size: 16px;
+    }}
+    figure {{
+      margin: 0 0 18px;
+    }}
+    figcaption {{
+      margin-top: 6px;
+      font-size: 12px;
+      color: #4b5563;
+    }}
     img {{
       max-width: 100%;
       height: auto;
+      border: 1px solid #e5e7eb;
     }}
   </style>
 </head>
@@ -276,6 +483,7 @@ def wrap_email_html(subject: str, sender: str, date_value: str, body_html: str) 
     <p><strong>Date:</strong> {html.escape(date_value or "")}</p>
   </div>
   <div class="email-body">{body_html}</div>
+  {attachments_html}
 </body>
 </html>
 """
@@ -283,6 +491,34 @@ def wrap_email_html(subject: str, sender: str, date_value: str, body_html: str) 
 
 def plain_to_html(text: str) -> str:
     return f"<pre>{html.escape(text)}</pre>"
+
+
+def extract_attachment_images_html(message: Message) -> str:
+    figures: list[str] = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        if part.get_content_disposition() != "attachment":
+            continue
+        mime_type = part.get_content_type().lower()
+        if not mime_type.startswith("image/"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        filename = normalize_text(part.get_filename() or "")
+        encoded = base64.b64encode(payload).decode("ascii")
+        data_uri = f"data:{mime_type};base64,{encoded}"
+        label = filename or mime_type
+        figures.append(
+            "<figure>"
+            f"<img src=\"{data_uri}\" alt=\"{html.escape(label)}\" />"
+            f"<figcaption>{html.escape(label)}</figcaption>"
+            "</figure>"
+        )
+    if not figures:
+        return ""
+    return "<section class=\"attachments\"><h2>Attached receipt images</h2>" + "".join(figures) + "</section>"
 
 
 def write_renderable_html(message_id: str, subject: str, message: Message) -> Path:
@@ -294,7 +530,8 @@ def write_renderable_html(message_id: str, subject: str, message: Message) -> Pa
         html_body = plain_to_html(plain_body)
     else:
         html_body = inject_cid_images(html_body, build_cid_map(message))
-    wrapped = wrap_email_html(subject, sender, date_value, html_body)
+    attachments_html = extract_attachment_images_html(message)
+    wrapped = wrap_email_html(subject, sender, date_value, html_body, attachments_html)
     html_path = HTML_DIR / safe_filename(subject, message_id, "html")
     html_path.write_text(wrapped, encoding="utf-8")
     return html_path
@@ -312,6 +549,7 @@ def chrome_path() -> str:
 
 def print_html_to_pdf(html_path: Path, pdf_path: Path) -> None:
     renderer = Path(__file__).with_name("render_email_html_to_pdf.js")
+    ensure_playwright_core()
     command = [
         "node",
         str(renderer),
@@ -319,7 +557,7 @@ def print_html_to_pdf(html_path: Path, pdf_path: Path) -> None:
         str(pdf_path.resolve()),
         chrome_path(),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=120)
+    result = run_command(command, timeout=120)
     if result.returncode != 0:
         raise RuntimeError(f"PDF render failed for {html_path}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
@@ -376,9 +614,9 @@ def process_message(candidate: Candidate, folder_id: str) -> dict:
 def main() -> None:
     ensure_dirs()
     clear_local_artifacts()
+    ensure_playwright_core()
     folder_name = folder_name_for_today()
     folder_id = ensure_drive_folder(folder_name)
-    clear_drive_folder(folder_id)
     processed = [process_message(candidate, folder_id) for candidate in get_candidates()]
     print(json.dumps({
         "folderId": folder_id,
@@ -389,4 +627,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"error": str(error)}))
+        sys.exit(1)
